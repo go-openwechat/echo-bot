@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,7 +14,7 @@ import (
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Configuration (all overridable via environment variables)
+// Configuration – all values are read from environment variables with sensible defaults
 // ─────────────────────────────────────────────────────────────────────────────
 var (
 	baseURL      = getEnv("WEPROTOCOL_BASE_URL", "http://127.0.0.1:8080")
@@ -22,12 +23,11 @@ var (
 	httpClient   = &http.Client{Timeout: 15 * time.Second}
 )
 
-// currentSynckey is persisted across polls (exactly as the official server expects)
+// currentSynckey is automatically maintained across poll cycles exactly as required by the WeProtocol server
 var currentSynckey string
 
 // ─────────────────────────────────────────────────────────────────────────────
-// API types (100% faithful to WeProtocol's internal Swagger + controller models)
-// Expanded with ALL common fields returned by /api/Msg/Sync for maximum info
+// API data structures – precisely matching the WeProtocol Swagger and internal models
 // ─────────────────────────────────────────────────────────────────────────────
 type MsgSyncReq struct {
 	Scene   int    `json:"Scene"`
@@ -77,16 +77,37 @@ type Message struct {
 	ImgStatus    int
 }
 
+type LoginGetQRResp struct {
+	Code int `json:"Code"`
+	Data struct {
+		Uuid    string `json:"Uuid"`
+		QRCode  string `json:"QRCode"`
+		Message string `json:"Message"`
+	} `json:"Data"`
+}
+
+type LoginCheckResp struct {
+	Code int `json:"Code"`
+	Data struct {
+		Wxid string `json:"Wxid"`
+	} `json:"Data"`
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Main entry point
 // ─────────────────────────────────────────────────────────────────────────────
 func main() {
 	// Validate required config
 	if wxid == "" {
-		log.Fatal("❌ WEPROTOCOL_WXID environment variable is required")
+		log.Println("No WXID configured – starting automatic login sequence")
+		doLogin()
 	}
 
-	log.Printf("🚀 WeProtocol Professional Client started")
+	if wxid == "" {
+		log.Fatal("WEPROTOCOL_WXID environment variable is required")
+	}
+
+	log.Printf("WeProtocol Professional Client started")
 	log.Printf("   Base URL      : %s", baseURL)
 	log.Printf("   WXID          : %s", wxid)
 	log.Printf("   Poll interval : %s", pollInterval)
@@ -109,9 +130,7 @@ func main() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Message Business Logic
-// OnMessage – this is where ALL your business logic lives
-// Add new commands here. Everything is case-insensitive for commands.
+// Message business logic – single place for all command handling
 // ─────────────────────────────────────────────────────────────────────────────
 func OnMessage(msg Message) {
 	if msg.MsgType != 1 { // only text messages
@@ -150,21 +169,26 @@ func OnMessage(msg Message) {
 	// log.Printf("Ignored message from %s: %s", msg.FromUserName, contentTrim)
 }
 
-// sendInfo – replies with full derived information (talker, room, timestamps, IDs, status, etc.)
-// This is the maximum that can be derived directly from the /Msg/Sync payload.
+// ─────────────────────────────────────────────────────────────────────────────
+// /info command – returns every piece of information derivable from the message payload
+// ─────────────────────────────────────────────────────────────────────────────
 func sendInfo(msg Message) {
 	isGroup := strings.HasSuffix(msg.FromUserName, "@chatroom")
-
 	talker := msg.FromUserName
 	room := "Private chat (1:1)"
 	if isGroup {
 		room = msg.FromUserName
-		talker = "Group member (actual sender WXID not exposed in basic AddMsg payload)"
+		talker = "Group member (sender WXID not exposed in basic payload)"
 	}
 
 	ts := "unknown"
 	if msg.CreateTime != 0 {
 		ts = time.Unix(msg.CreateTime, 0).Format(time.RFC3339)
+	}
+
+	preview := msg.Content
+	if len(msg.Content) > 120 {
+		preview = msg.Content[:120] + "..."
 	}
 
 	info := fmt.Sprintf(`📋 /info – Full Message Details
@@ -177,7 +201,7 @@ func sendInfo(msg Message) {
 • MsgType: %d
 • Status: %d
 • ImgStatus: %d
-• Content preview: %.120s%s`,
+• Content preview: %s`,
 		talker,
 		room,
 		msg.ToUserName,
@@ -186,20 +210,114 @@ func sendInfo(msg Message) {
 		msg.MsgType,
 		msg.Status,
 		msg.ImgStatus,
-		msg.Content,
-		func() string {
-			if len(msg.Content) > 120 {
-				return "..."
-			}
-			return ""
-		}(),
+		preview,
 	)
 
 	sendMessage(msg.FromUserName, info)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WeProtocol API Layer (Core protocol calls)
+// Automatic login flow – runs only when no WXID is present
+// ─────────────────────────────────────────────────────────────────────────────
+func doLogin() {
+	log.Println("Requesting QR code...")
+
+	qrResp, err := loginGetQR()
+	if err != nil {
+		log.Fatal("Failed to get QR code:", err)
+	}
+	if qrResp.Code != 0 {
+		log.Fatal("LoginGetQR API error:", qrResp.Data.Message)
+	}
+
+	uuid := qrResp.Data.Uuid
+	if uuid == "" {
+		log.Fatal("No UUID returned from server")
+	}
+
+	handled := false
+	if qrResp.Data.QRCode != "" {
+		if saveQRAsPNG(qrResp.Data.QRCode) {
+			log.Println("QR code saved as login_qr.png")
+			log.Println("   → Open login_qr.png and scan with WeChat")
+			handled = true
+		} else if strings.HasPrefix(qrResp.Data.QRCode, "http") {
+			log.Println("QR code URL:", qrResp.Data.QRCode)
+			log.Println("   → Open the URL in browser and scan with WeChat")
+			handled = true
+		}
+	}
+
+	if !handled {
+		qrURL := "https://login.weixin.qq.com/l/" + uuid
+		log.Println("QR code URL:", qrURL)
+		log.Println("   → Open this URL in any browser and scan with WeChat")
+	}
+
+	log.Println("Waiting for scan and confirmation on your phone...")
+
+	for {
+		checkResp, err := loginCheckQR(uuid)
+		if err != nil {
+			log.Printf("Check error (retrying): %v", err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if checkResp.Code == 0 && checkResp.Data.Wxid != "" {
+			wxid = checkResp.Data.Wxid
+			log.Printf("Login successful! WXID: %s", wxid)
+			return
+		}
+
+		log.Printf("Login status: Code=%d (still waiting)", checkResp.Code)
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func loginGetQR() (LoginGetQRResp, error) {
+	resp, err := httpClient.Post(baseURL+"/api/Login/LoginGetQR", "application/json", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return LoginGetQRResp{}, fmt.Errorf("http post: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	var r LoginGetQRResp
+	json.Unmarshal(raw, &r)
+	return r, nil
+}
+
+func loginCheckQR(uuid string) (LoginCheckResp, error) {
+	url := baseURL + "/api/Login/LoginCheckQR?uuid=" + uuid
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return LoginCheckResp{}, fmt.Errorf("http post: %w", err)
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	var r LoginCheckResp
+	json.Unmarshal(raw, &r)
+	return r, nil
+}
+
+func saveQRAsPNG(qrData string) bool {
+	b64 := qrData
+	if idx := strings.Index(b64, ","); idx != -1 {
+		b64 = b64[idx+1:]
+	}
+
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return false
+	}
+
+	return os.WriteFile("login_qr.png", data, 0644) == nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WeProtocol API layer – core sync and send operations with full error handling
 // ─────────────────────────────────────────────────────────────────────────────
 func syncMessages() ([]Message, error) {
 	req := MsgSyncReq{
@@ -296,7 +414,7 @@ func sendMessage(toWxid, content string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Configuration & Helpers (least important – pure utilities)
+// Configuration helpers
 // ─────────────────────────────────────────────────────────────────────────────
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
