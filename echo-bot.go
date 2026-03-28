@@ -225,31 +225,42 @@ func sendInfo(msg Message) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Automatic login flow – runs only when no WXID is present
+// Automatic login flow – attempts silent resumption or push notification before falling back to QR
 // ─────────────────────────────────────────────────────────────────────────────
 func doLogin() {
-	log.Println("Requesting QR code...")
-
-	qrResp, err := loginGetQR()
-	if err != nil {
-		log.Fatal("Failed to get QR code:", err)
-	}
-	if !qrResp.Success {
-		log.Printf("]:  %+v\n \n", qrResp)
-		log.Fatal("LoginGetQR API error:", qrResp.Message)
+	// Attempt silent session resumption first if the server still holds valid credentials
+	if success, err := loginTwiceAutoAuth(); err == nil && success {
+		log.Printf("Successfully resumed session for WXID: %s", wxid)
+		return
 	}
 
-	uuid := qrResp.Data.Uuid
-	if uuid == "" {
-		log.Printf("]:  %+v\n \n", qrResp)
-		log.Fatal("No UUID returned from server")
-	}
+	var uuid string
+	log.Println("Attempting push login notification...")
+	if pushUuid, err := loginAwaken(); err == nil && pushUuid != "" {
+		uuid = pushUuid
+		log.Println("Push notification sent to your phone. Please confirm the login.")
+	} else {
+		log.Println("Push login unavailable, falling back to QR code...")
+		qrResp, err := loginGetQR()
+		if err != nil {
+			log.Fatal("Failed to get QR code:", err)
+		}
+		if !qrResp.Success {
+			log.Printf("]:  %+v\n \n", qrResp)
+			log.Fatal("LoginGetQR API error:", qrResp.Message)
+		}
+		uuid = qrResp.Data.Uuid
+		if uuid == "" {
+			log.Printf("]:  %+v\n \n", qrResp)
+			log.Fatal("No UUID returned from server")
+		}
 
-	if qrResp.Data.QrUrl != "" && strings.HasPrefix(qrResp.Data.QrUrl, "http") {
-		log.Println("QR code URL:", qrResp.Data.QrUrl)
-		log.Println("   → Open the URL in browser and scan with WeChat")
+		if qrResp.Data.QrUrl != "" && strings.HasPrefix(qrResp.Data.QrUrl, "http") {
+			log.Println("QR code URL:", qrResp.Data.QrUrl)
+			log.Println("   → Open the URL in browser and scan with WeChat")
+		}
+		log.Println("Waiting for scan and confirmation on your phone...")
 	}
-	log.Println("Waiting for scan and confirmation on your phone...")
 
 	for {
 		time.Sleep(12 * time.Second)
@@ -268,6 +279,51 @@ func doLogin() {
 
 		log.Printf("Login status: Code=%d, Status=%d (still waiting)", checkResp.Code, checkResp.Data.Status)
 	}
+}
+
+// loginTwiceAutoAuth attempts a silent login using existing session tokens on the server
+func loginTwiceAutoAuth() (bool, error) {
+	url := fmt.Sprintf("%s/api/Login/LoginTwiceAutoAuth?wxid=%s", baseURL, wxid)
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader([]byte("{}")))
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	var r struct {
+		Code    int  `json:"Code"`
+		Success bool `json:"Success"`
+	}
+	json.Unmarshal(raw, &r)
+	return r.Code == 0 && r.Success, nil
+}
+
+// loginAwaken triggers a login confirmation push notification to the mobile device
+func loginAwaken() (string, error) {
+	url := baseURL + "/api/Login/LoginAwaken"
+	body := fmt.Sprintf(`{"Wxid":"%s"}`, wxid)
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader([]byte(body)))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	raw, _ := io.ReadAll(resp.Body)
+	var r struct {
+		Code    int  `json:"Code"`
+		Success bool `json:"Success"`
+		Data    struct {
+			Uuid string `json:"Uuid"`
+		} `json:"Data"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return "", err
+	}
+	if r.Code == 0 && r.Success {
+		return r.Data.Uuid, nil
+	}
+	return "", fmt.Errorf("push login failed: %d", r.Code)
 }
 
 func loginGetQR() (LoginGetQRResp, error) {
