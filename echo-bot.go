@@ -17,8 +17,9 @@ import (
 // Configuration – all values are read from environment variables with sensible defaults
 // ─────────────────────────────────────────────────────────────────────────────
 var (
-	baseURL      = getEnv("WEPROTOCOL_BASE_URL", "http://127.0.0.1:8080")
+	baseURL      = getEnv("WEPROTOCOL_BASE_URL", "http://127.0.0.1:8058")
 	wxid         = getEnv("WEPROTOCOL_WXID", "")
+	deviceID     = getEnv("WEPROTOCOL_DEVICE_ID", "49c2a248031c98d023f212d289c07d85")
 	pollInterval = mustParseDuration(getEnv("WEPROTOCOL_POLL_INTERVAL", "3s"))
 	httpClient   = &http.Client{Timeout: 15 * time.Second}
 )
@@ -78,19 +79,29 @@ type Message struct {
 }
 
 type LoginGetQRResp struct {
-	Code int `json:"Code"`
-	Data struct {
-		Uuid    string `json:"Uuid"`
-		QRCode  string `json:"QRCode"`
-		Message string `json:"Message"`
+	Code    int    `json:"Code"`
+	Success bool   `json:"Success"`
+	Message string `json:"Message"`
+	Data    struct {
+		Uuid string `json:"Uuid"`
+		//QrBase64    string `json:"QrBase64"`
+		QrUrl       string `json:"QrUrl"`
+		ExpiredTime string `json:"ExpiredTime"`
 	} `json:"Data"`
+	Data62   string `json:"Data62"`
+	DeviceId string `json:"DeviceId"`
 }
 
 type LoginCheckResp struct {
-	Code int `json:"Code"`
-	Data struct {
-		Wxid string `json:"Wxid"`
+	Code    int    `json:"Code"`
+	Success bool   `json:"Success"`
+	Message string `json:"Message"`
+	Data    struct {
+		Uuid   string `json:"uuid"`
+		Status int    `json:"status"`
 	} `json:"Data"`
+	Data62 string `json:"Data62"`
+	Debug  string `json:"Debug"`
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,13 +110,10 @@ type LoginCheckResp struct {
 func main() {
 	// Validate required config
 	if wxid == "" {
-		log.Println("No WXID configured – starting automatic login sequence")
-		doLogin()
-	}
-
-	if wxid == "" {
 		log.Fatal("WEPROTOCOL_WXID environment variable is required")
 	}
+	log.Println("Starting automatic login sequence")
+	doLogin()
 
 	log.Printf("WeProtocol Professional Client started")
 	log.Printf("   Base URL      : %s", baseURL)
@@ -226,63 +234,52 @@ func doLogin() {
 	if err != nil {
 		log.Fatal("Failed to get QR code:", err)
 	}
-	if qrResp.Code != 0 {
-		log.Fatal("LoginGetQR API error:", qrResp.Data.Message)
+	if !qrResp.Success {
+		log.Printf("]:  %+v\n \n", qrResp)
+		log.Fatal("LoginGetQR API error:", qrResp.Message)
 	}
 
 	uuid := qrResp.Data.Uuid
 	if uuid == "" {
+		log.Printf("]:  %+v\n \n", qrResp)
 		log.Fatal("No UUID returned from server")
 	}
 
-	handled := false
-	if qrResp.Data.QRCode != "" {
-		if saveQRAsPNG(qrResp.Data.QRCode) {
-			log.Println("QR code saved as login_qr.png")
-			log.Println("   → Open login_qr.png and scan with WeChat")
-			handled = true
-		} else if strings.HasPrefix(qrResp.Data.QRCode, "http") {
-			log.Println("QR code URL:", qrResp.Data.QRCode)
-			log.Println("   → Open the URL in browser and scan with WeChat")
-			handled = true
-		}
+	if qrResp.Data.QrUrl != "" && strings.HasPrefix(qrResp.Data.QrUrl, "http") {
+		log.Println("QR code URL:", qrResp.Data.QrUrl)
+		log.Println("   → Open the URL in browser and scan with WeChat")
 	}
-
-	if !handled {
-		qrURL := "https://login.weixin.qq.com/l/" + uuid
-		log.Println("QR code URL:", qrURL)
-		log.Println("   → Open this URL in any browser and scan with WeChat")
-	}
-
 	log.Println("Waiting for scan and confirmation on your phone...")
 
 	for {
+		time.Sleep(12 * time.Second)
 		checkResp, err := loginCheckQR(uuid)
 		if err != nil {
 			log.Printf("Check error (retrying): %v", err)
-			time.Sleep(2 * time.Second)
 			continue
 		}
 
-		if checkResp.Code == 0 && checkResp.Data.Wxid != "" {
-			wxid = checkResp.Data.Wxid
+		// Status 1 = scanned/confirmed, Status 2 = login completed (both mean success now)
+		if checkResp.Code == 0 && (checkResp.Data.Status == 1 || checkResp.Data.Status == 2) {
 			log.Printf("Login successful! WXID: %s", wxid)
+			time.Sleep(8 * time.Second) // brief stabilization delay after login
 			return
 		}
 
-		log.Printf("Login status: Code=%d (still waiting)", checkResp.Code)
-		time.Sleep(2 * time.Second)
+		log.Printf("Login status: Code=%d, Status=%d (still waiting)", checkResp.Code, checkResp.Data.Status)
 	}
 }
 
 func loginGetQR() (LoginGetQRResp, error) {
-	resp, err := httpClient.Post(baseURL+"/api/Login/LoginGetQR", "application/json", bytes.NewReader([]byte("{}")))
+	// DeviceID is included in the LoginGetQR request body as required by the WeProtocol server
+	resp, err := httpClient.Post(baseURL+"/api/Login/LoginGetQR", "application/json", bytes.NewReader([]byte(`{"DeviceID":"`+deviceID+`"}`)))
 	if err != nil {
 		return LoginGetQRResp{}, fmt.Errorf("http post: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
+	log.Printf("]:  %+v\n \n", string(raw))
 	var r LoginGetQRResp
 	json.Unmarshal(raw, &r)
 	return r, nil
@@ -297,8 +294,33 @@ func loginCheckQR(uuid string) (LoginCheckResp, error) {
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(resp.Body)
+	log.Printf("]:  %+v\n \n", string(raw))
+
+	// Handle persistent server-side panic (beego HTML error page) triggered right after QR scan/confirm.
+	// Root cause (from stack trace): runtime error: index out of range [0] with length 0
+	// in /usr/wic-go/Algorithm/Pack.go:124 → SecManualAuth.go:151 → CheckSecManualAuth.go:129
+	// (known wic-go / WeProtocol backend bug during CheckUuid → SecManualAuth transition).
+	// When detected we fake a success response (Status=2) so the doLogin loop exits cleanly.
+	if len(raw) > 50 && bytes.Contains(raw, []byte("beego application error")) {
+		return LoginCheckResp{}, fmt.Errorf("WeProtocol beego server runtime panic")
+
+		// log.Println("⚠️  WeProtocol server runtime panic in SecManualAuth detected after QR scan – treating as login confirmed (known backend bug)")
+		// return LoginCheckResp{
+		// 	Code:    0,
+		// 	Success: true,
+		// 	Data: struct {
+		// 		Uuid   string `json:"uuid"`
+		// 		Status int    `json:"status"`
+		// 	}{
+		// 		Status: 2,
+		// 	},
+		// }, nil
+	}
+
 	var r LoginCheckResp
-	json.Unmarshal(raw, &r)
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return LoginCheckResp{}, fmt.Errorf("unmarshal login check response: %w", err)
+	}
 	return r, nil
 }
 
@@ -345,6 +367,22 @@ func syncMessages() ([]Message, error) {
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read /Sync body: %w", err)
+	}
+
+	// Log the raw response (keep original behavior)
+	log.Printf("]Msg/Sync:  %+v\n \n", string(raw))
+
+	// Handle both known server-side panics in /Msg/Sync (and LoginCheckQR):
+	// 1. Full beego HTML error page
+	// 2. Empty/short response (happens when the backend panics before writing JSON)
+	// Root cause (from stack trace): slice bounds out of range [:-16] in AES.go:225
+	// → Pack.go:208 → Mmtls.go:46 → sync.go:86 (incomplete session keys after buggy SecManualAuth).
+	// When detected we return empty slice (no error) so the main loop continues cleanly.
+	if len(raw) == 0 || len(raw) < 50 ||
+		bytes.Contains(raw, []byte("beego application error")) ||
+		bytes.HasPrefix(bytes.TrimSpace(raw), []byte("<!DOCTYPE html>")) {
+		log.Println("⚠️  WeProtocol server runtime panic in Msg/Sync (or empty response) detected – known backend bug, continuing with empty sync")
+		return []Message{}, nil
 	}
 
 	var apiResp MsgSyncResp
